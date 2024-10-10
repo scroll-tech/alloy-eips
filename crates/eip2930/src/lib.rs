@@ -2,6 +2,7 @@
 //!
 //! [EIP-2930]: https://eips.ethereum.org/EIPS/eip-2930
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(feature = "rkyv", allow(missing_docs))]
 
 #[allow(unused_imports)]
 #[macro_use]
@@ -20,8 +21,8 @@ use core::{mem, ops::Deref};
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 #[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
-#[cfg_attr(feature = "rkyv", archive(check_bytes))]
-#[cfg_attr(feature = "rkyv", archive_attr(derive(Debug, Hash, PartialEq, Eq)))]
+#[cfg_attr(feature = "rkyv", rkyv(derive(Debug, Hash, PartialEq, Eq)))]
+
 pub struct AccessListItem {
     /// Account addresses that would be loaded at the start of execution
     pub address: Address,
@@ -42,8 +43,7 @@ impl AccessListItem {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
-#[cfg_attr(feature = "rkyv", archive(check_bytes))]
-#[cfg_attr(feature = "rkyv", archive_attr(derive(Debug, Hash, PartialEq, Eq)))]
+#[cfg_attr(feature = "rkyv", rkyv(derive(Debug, Hash, PartialEq, Eq)))]
 pub struct AccessList(pub Vec<AccessListItem>);
 
 impl From<Vec<AccessListItem>> for AccessList {
