@@ -2,7 +2,7 @@ use core::ops::Deref;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-use alloy_primitives::{keccak256, Address, Signature, B256, U256};
+use alloy_primitives::{keccak256, Address, Parity, Signature, SignatureError, B256, U256, U8};
 use alloy_rlp::{
     length_of_length, BufMut, Decodable, Encodable, Header, Result as RlpResult, RlpDecodable,
     RlpEncodable,
@@ -47,7 +47,8 @@ impl RecoveredAuthority {
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Authorization {
     /// The chain ID of the authorization.
-    pub chain_id: U256,
+    #[cfg_attr(feature = "serde", serde(with = "quantity"))]
+    pub chain_id: u64,
     /// The address of the authorization.
     pub address: Address,
     /// The nonce for the authorization.
@@ -61,7 +62,7 @@ impl Authorization {
     /// # Note
     ///
     /// Implementers should check that this matches the current `chain_id` *or* is 0.
-    pub const fn chain_id(&self) -> U256 {
+    pub const fn chain_id(&self) -> u64 {
         self.chain_id
     }
 
@@ -91,8 +92,13 @@ impl Authorization {
     }
 
     /// Convert to a signed authorization by adding a signature.
-    pub const fn into_signed(self, signature: Signature) -> SignedAuthorization {
-        SignedAuthorization { inner: self, signature }
+    pub fn into_signed(self, signature: Signature) -> SignedAuthorization {
+        SignedAuthorization {
+            inner: self,
+            r: signature.r(),
+            s: signature.s(),
+            y_parity: U8::from(signature.v().y_parity() as u8),
+        }
     }
 }
 
@@ -100,21 +106,61 @@ impl Authorization {
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SignedAuthorization {
+    /// Inner authorization.
     #[cfg_attr(feature = "serde", serde(flatten))]
     inner: Authorization,
-    #[cfg_attr(feature = "serde", serde(flatten))]
-    signature: Signature,
+    /// Signature parity value. We allow any [`U8`] here, however, the only valid values are `0`
+    /// and `1` and anything else will result in error during recovery.
+    #[cfg_attr(feature = "serde", serde(rename = "yParity"))]
+    y_parity: U8,
+    /// Signature `r` value.
+    r: U256,
+    /// Signature `s` value.
+    s: U256,
 }
 
 impl SignedAuthorization {
-    /// Get the `signature` for the authorization.
-    pub const fn signature(&self) -> &Signature {
-        &self.signature
+    /// Creates a new signed authorization from raw signature values.
+    pub fn new_unchecked(inner: Authorization, y_parity: u8, r: U256, s: U256) -> Self {
+        Self { inner, y_parity: U8::from(y_parity), r, s }
     }
 
-    /// Splits the authorization into parts.
-    pub const fn into_parts(self) -> (Authorization, Signature) {
-        (self.inner, self.signature)
+    /// Gets the `signature` for the authorization. Returns [`SignatureError`] if signature could
+    /// not be constructed from vrs values.
+    ///
+    /// Note that this signature might still be invalid for recovery as it might have `s` value
+    /// greater than [secp256k1n/2](crate::constants::SECP256K1N_HALF).
+    pub fn signature(&self) -> Result<Signature, SignatureError> {
+        if self.y_parity() <= 1 {
+            Ok(Signature::new(self.r, self.s, Parity::Parity(self.y_parity() == 1)))
+        } else {
+            Err(SignatureError::InvalidParity(self.y_parity() as u64))
+        }
+    }
+
+    /// Returns the inner [`Authorization`].
+    pub const fn strip_signature(self) -> Authorization {
+        self.inner
+    }
+
+    /// Returns the inner [`Authorization`].
+    pub const fn inner(&self) -> &Authorization {
+        &self.inner
+    }
+
+    /// Returns the signature parity value.
+    pub fn y_parity(&self) -> u8 {
+        self.y_parity.to()
+    }
+
+    /// Returns the signature `r` value.
+    pub const fn r(&self) -> U256 {
+        self.r
+    }
+
+    /// Returns the signature `s` value.
+    pub const fn s(&self) -> U256 {
+        self.s
     }
 
     /// Decodes the transaction from RLP bytes, including the signature.
@@ -125,7 +171,9 @@ impl SignedAuthorization {
                 address: Decodable::decode(buf)?,
                 nonce: Decodable::decode(buf)?,
             },
-            signature: Signature::decode_rlp_vrs(buf)?,
+            y_parity: Decodable::decode(buf)?,
+            r: Decodable::decode(buf)?,
+            s: Decodable::decode(buf)?,
         })
     }
 
@@ -134,16 +182,18 @@ impl SignedAuthorization {
         self.inner.chain_id.length()
             + self.inner.address.length()
             + self.inner.nonce.length()
-            + self.signature.rlp_vrs_len()
+            + self.y_parity.length()
+            + self.r.length()
+            + self.s.length()
     }
 }
 
 impl Hash for SignedAuthorization {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.inner.hash(state);
-        self.signature.r().hash(state);
-        self.signature.s().hash(state);
-        self.signature.v().to_u64().hash(state);
+        self.r.hash(state);
+        self.s.hash(state);
+        self.y_parity.hash(state);
     }
 }
 
@@ -153,7 +203,19 @@ impl Decodable for SignedAuthorization {
         if !header.list {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
-        Self::decode_fields(buf)
+        let started_len = buf.len();
+
+        let this = Self::decode_fields(buf)?;
+
+        let consumed = started_len - buf.len();
+        if consumed != header.payload_length {
+            return Err(alloy_rlp::Error::ListLengthMismatch {
+                expected: header.payload_length,
+                got: consumed,
+            });
+        }
+
+        Ok(this)
     }
 }
 
@@ -163,7 +225,9 @@ impl Encodable for SignedAuthorization {
         self.inner.chain_id.encode(buf);
         self.inner.address.encode(buf);
         self.inner.nonce.encode(buf);
-        self.signature.write_rlp_vrs(buf)
+        self.y_parity.encode(buf);
+        self.r.encode(buf);
+        self.s.encode(buf);
     }
 
     fn length(&self) -> usize {
@@ -179,8 +243,14 @@ impl SignedAuthorization {
     /// # Note
     ///
     /// Implementers should check that the authority has no code.
-    pub fn recover_authority(&self) -> Result<Address, alloy_primitives::SignatureError> {
-        self.signature.recover_address_from_prehash(&self.inner.signature_hash())
+    pub fn recover_authority(&self) -> Result<Address, crate::error::Eip7702Error> {
+        let signature = self.signature()?;
+
+        if signature.s() > crate::constants::SECP256K1N_HALF {
+            return Err(crate::error::Eip7702Error::InvalidSValue(signature.s()));
+        }
+
+        Ok(signature.recover_address_from_prehash(&self.inner.signature_hash())?)
     }
 
     /// Recover the authority and transform the signed authorization into a
@@ -223,7 +293,7 @@ impl<'a> arbitrary::Arbitrary<'a> for SignedAuthorization {
         let signature = Signature::from_signature_and_parity(recoverable_sig, recovery_id)
             .map_err(|_| arbitrary::Error::IncorrectFormat)?;
 
-        Ok(Self { inner, signature })
+        Ok(inner.into_signed(signature))
     }
 }
 
@@ -316,7 +386,7 @@ mod tests {
     fn test_encode_decode_auth() {
         // fully filled
         test_encode_decode_roundtrip(Authorization {
-            chain_id: U256::from(1u64),
+            chain_id: 1u64,
             address: Address::left_padding_from(&[6]),
             nonce: 1,
         });
@@ -324,18 +394,14 @@ mod tests {
 
     #[test]
     fn test_encode_decode_signed_auth() {
-        let auth = SignedAuthorization {
-            inner: Authorization {
-                chain_id: U256::from(1u64),
-                address: Address::left_padding_from(&[6]),
-                nonce: 1,
-            },
-            signature: Signature::from_str("48b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353efffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c8041b").unwrap(),
-        };
+        let auth =
+            Authorization { chain_id: 1u64, address: Address::left_padding_from(&[6]), nonce: 1 };
+
+        let auth = auth.into_signed(Signature::from_str("48b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353efffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c8041b").unwrap());
         let mut buf = Vec::new();
         auth.encode(&mut buf);
 
-        let expected = "f85a01940000000000000000000000000000000000000006011ba048b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353a0efffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c804";
+        let expected = "f85a019400000000000000000000000000000000000000060180a048b55bfa915ac795c431978d8a6a992b628d557da5ff759b307d495a36649353a0efffd310ac743f371de3b9f7f9cb56c0b28ad43601b4ab949f53faa07bd2c804";
         assert_eq!(hex::encode(&buf), expected);
 
         let decoded = SignedAuthorization::decode(&mut buf.as_ref()).unwrap();
@@ -347,16 +413,11 @@ mod tests {
     #[test]
     fn test_auth_json() {
         let sig = r#"{"r":"0xc569c92f176a3be1a6352dd5005bfc751dcb32f57623dd2a23693e64bf4447b0","s":"0x1a891b566d369e79b7a66eecab1e008831e22daa15f91a0a0cf4f9f28f47ee05","yParity":"0x1"}"#;
-        let auth = SignedAuthorization {
-            inner: Authorization {
-                chain_id: U256::from(1u64),
-                address: Address::left_padding_from(&[6]),
-                nonce: 1,
-            },
-            signature: serde_json::from_str(sig).unwrap(),
-        };
+        let auth =
+            Authorization { chain_id: 1u64, address: Address::left_padding_from(&[6]), nonce: 1 }
+                .into_signed(serde_json::from_str(sig).unwrap());
         let val = serde_json::to_string(&auth).unwrap();
-        let s = r#"{"chainId":"0x1","address":"0x0000000000000000000000000000000000000006","nonce":"0x1","r":"0xc569c92f176a3be1a6352dd5005bfc751dcb32f57623dd2a23693e64bf4447b0","s":"0x1a891b566d369e79b7a66eecab1e008831e22daa15f91a0a0cf4f9f28f47ee05","yParity":"0x1"}"#;
+        let s = r#"{"chainId":"0x1","address":"0x0000000000000000000000000000000000000006","nonce":"0x1","yParity":"0x1","r":"0xc569c92f176a3be1a6352dd5005bfc751dcb32f57623dd2a23693e64bf4447b0","s":"0x1a891b566d369e79b7a66eecab1e008831e22daa15f91a0a0cf4f9f28f47ee05"}"#;
         assert_eq!(val, s);
     }
 
@@ -370,5 +431,116 @@ mod tests {
         let _auth = SignedAuthorization::arbitrary(&mut unstructured).unwrap();
         let _auth = SignedAuthorization::arbitrary(&mut unstructured).unwrap();
         let _auth = SignedAuthorization::arbitrary(&mut unstructured).unwrap();
+    }
+}
+
+/// Bincode-compatible [`SignedAuthorization`] serde implementation.
+#[cfg(all(feature = "serde", feature = "serde-bincode-compat"))]
+pub(super) mod serde_bincode_compat {
+    use alloc::borrow::Cow;
+    use alloy_primitives::{U256, U8};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_with::{DeserializeAs, SerializeAs};
+
+    use crate::Authorization;
+
+    /// Bincode-compatible [`super::SignedAuthorization`] serde implementation.
+    ///
+    /// Intended to use with the [`serde_with::serde_as`] macro in the following way:
+    /// ```rust
+    /// use alloy_eip7702::{serde_bincode_compat, SignedAuthorization};
+    /// use serde::{Deserialize, Serialize};
+    /// use serde_with::serde_as;
+    ///
+    /// #[serde_as]
+    /// #[derive(Serialize, Deserialize)]
+    /// struct Data {
+    ///     #[serde_as(as = "serde_bincode_compat::SignedAuthorization")]
+    ///     authorization: SignedAuthorization,
+    /// }
+    /// ```
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct SignedAuthorization<'a> {
+        inner: Cow<'a, Authorization>,
+        #[serde(rename = "yParity")]
+        y_parity: U8,
+        r: U256,
+        s: U256,
+    }
+
+    impl<'a> From<&'a super::SignedAuthorization> for SignedAuthorization<'a> {
+        fn from(value: &'a super::SignedAuthorization) -> Self {
+            Self {
+                inner: Cow::Borrowed(&value.inner),
+                y_parity: value.y_parity,
+                r: value.r,
+                s: value.s,
+            }
+        }
+    }
+
+    impl<'a> From<SignedAuthorization<'a>> for super::SignedAuthorization {
+        fn from(value: SignedAuthorization<'a>) -> Self {
+            Self {
+                inner: value.inner.into_owned(),
+                y_parity: value.y_parity,
+                r: value.r,
+                s: value.s,
+            }
+        }
+    }
+
+    impl<'a> SerializeAs<super::SignedAuthorization> for SignedAuthorization<'a> {
+        fn serialize_as<S>(
+            source: &super::SignedAuthorization,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            SignedAuthorization::from(source).serialize(serializer)
+        }
+    }
+
+    impl<'de> DeserializeAs<'de, super::SignedAuthorization> for SignedAuthorization<'de> {
+        fn deserialize_as<D>(deserializer: D) -> Result<super::SignedAuthorization, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            SignedAuthorization::deserialize(deserializer).map(Into::into)
+        }
+    }
+
+    #[cfg(all(test, feature = "k256"))]
+    mod tests {
+        use arbitrary::Arbitrary;
+        use rand::Rng;
+        use serde::{Deserialize, Serialize};
+        use serde_with::serde_as;
+
+        use super::super::{serde_bincode_compat, SignedAuthorization};
+
+        #[test]
+        fn test_signed_authorization_bincode_roundtrip() {
+            #[serde_as]
+            #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+            struct Data {
+                #[serde_as(as = "serde_bincode_compat::SignedAuthorization")]
+                authorization: SignedAuthorization,
+            }
+
+            let mut bytes = [0u8; 1024];
+            rand::thread_rng().fill(bytes.as_mut_slice());
+            let data = Data {
+                authorization: SignedAuthorization::arbitrary(&mut arbitrary::Unstructured::new(
+                    &bytes,
+                ))
+                .unwrap(),
+            };
+
+            let encoded = bincode::serialize(&data).unwrap();
+            let decoded: Data = bincode::deserialize(&encoded).unwrap();
+            assert_eq!(decoded, data);
+        }
     }
 }

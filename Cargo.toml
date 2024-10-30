@@ -3,9 +3,8 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.79"
 authors = ["Alloy Contributors"]
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/alloy-rs/eips"
@@ -38,7 +37,10 @@ alloy-primitives = { version = "0.8.0", default-features = false }
 alloy-rlp = { version = "0.3", default-features = false }
 
 # serde
-serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde = { version = "1.0", default-features = false, features = [
+    "derive",
+    "alloc",
+] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 
 # rkyv
